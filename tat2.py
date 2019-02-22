@@ -11,35 +11,36 @@ import matplotlib.pyplot as plt
 import seaborn
 seaborn.set_context(context="talk")
 
+
+# TODO: rm encoder completely
+
+
+# This outputs the logits, BTN
+# There will be a total of T predictions for an input sequence of length T
+# TODO: rewrite doc-string
 class FullModel(nn.Module):
     """
     A standard Encoder-Decoder architecture. Base for this and many 
     other models.
     """
-    def __init__(self, decoder, tgt_embed, generator):
+    def __init__(self, encoder, decoder, src_embed, tgt_embed, generator):
         super(FullModel, self).__init__()
+        self.encoder = encoder
         self.decoder = decoder
+        self.src_embed = src_embed
         self.tgt_embed = tgt_embed
         self.generator = generator
         
-    #def forward(self, src, tgt, src_mask, tgt_mask):
-    #    "Take in and process masked src and target sequences."
-    #    return self.decode(tgt, src_mask,
-    #                        tgt, tgt_mask)
     def forward(self, src, tgt, src_mask, tgt_mask):
         "Take in and process masked src and target sequences."
-        return self.decode(self.encode(src, src_mask), src_mask,
-                            tgt, tgt_mask)
+        return self.generator(self.decode(self.encode(src, src_mask), src_mask,
+                            tgt, tgt_mask))
     
     def encode(self, src, src_mask):
         return self.encoder(self.src_embed(src), src_mask)
     
     def decode(self, memory, src_mask, tgt, tgt_mask):
         return self.decoder(self.tgt_embed(tgt), memory, src_mask, tgt_mask)
-
-
-
-
 
 class Generator(nn.Module):
     "Define standard linear + softmax generation step."
@@ -54,6 +55,20 @@ def clones(module, N):
     "Produce N identical layers."
     return nn.ModuleList([copy.deepcopy(module) for _ in range(N)])
 
+class Encoder(nn.Module):
+    "Core encoder is a stack of N layers"
+    def __init__(self, layer, N):
+        super(Encoder, self).__init__()
+        self.layers = clones(layer, N)
+        self.norm = LayerNorm(layer.size)
+        
+    def forward(self, x, mask):
+        return x
+        #"Pass the input (and mask) through each layer in turn."
+        #for layer in self.layers:
+        #    x = layer(x, mask)
+        #return self.norm(x)
+
 class LayerNorm(nn.Module):
     "Construct a layernorm module (See citation for details)."
     def __init__(self, features, eps=1e-6):
@@ -67,9 +82,11 @@ class LayerNorm(nn.Module):
         std = x.std(-1, keepdim=True)
         return self.a_2 * (x - mean) / (std + self.eps) + self.b_2
 
+
 class ResidualBlock(nn.Module):
     """
     A residual connection followed by a layer norm.
+    Note for code simplicity the norm is first as opposed to last.
     """
     def __init__(self, size, dropout):
         super(ResidualBlock, self).__init__()
@@ -79,6 +96,22 @@ class ResidualBlock(nn.Module):
     def forward(self, x, sublayer):
         "Apply residual connection to any sublayer with the same size."
         return x + self.dropout(sublayer(self.norm(x)))
+
+
+class EncoderLayer(nn.Module):
+    "Encoder is made up of self-attn and feed forward (defined below)"
+    def __init__(self, size, self_attn, feed_forward, dropout):
+        super(EncoderLayer, self).__init__()
+        self.self_attn = self_attn
+        self.feed_forward = feed_forward
+        self.sublayer = clones(ResidualBlock(size, dropout), 2)
+        self.size = size
+
+    def forward(self, x, mask):
+        "Follow Figure 1 (left) for connections."
+        x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, mask))
+        return self.sublayer[1](x, self.feed_forward)
+
 
 class Decoder(nn.Module):
     "Generic N layer decoder with masking."
@@ -92,7 +125,6 @@ class Decoder(nn.Module):
             x = layer(x, memory, src_mask, tgt_mask)
         return self.norm(x)
 
-
 class DecoderLayer(nn.Module):
     "Decoder is made of self-attn, src-attn, and feed forward (defined below)"
     def __init__(self, size, self_attn, src_attn, feed_forward, dropout):
@@ -101,24 +133,15 @@ class DecoderLayer(nn.Module):
         self.self_attn = self_attn
         self.src_attn = src_attn
         self.feed_forward = feed_forward
-        # FIXME: this doesn't work for some reason
-        self.self_attention_block = ResidualBlock(size, dropout)
-        self.src_attention_block = ResidualBlock(size, dropout)
-        self.output_block = ResidualBlock(size, dropout)
+        self.sublayer = clones(ResidualBlock(size, dropout), 3)
  
     def forward(self, x, memory, src_mask, tgt_mask):
         "Follow Figure 1 (right) for connections."
         m = memory
-        x = self.self_attention_block(x, lambda x: self.self_attn(x, x, x, tgt_mask))
-        x = self.src_attention_block(x, lambda x: self.src_attn(x, m, m, tgt_mask))
-        return self.output_block(x, self.feed_forward)
-
-
-
-
-
-
-
+        x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, tgt_mask))
+        # ignore input sequence
+        #x = self.sublayer[1](x, lambda x: self.src_attn(x, m, m, src_mask))
+        return self.sublayer[2](x, self.feed_forward)
 
 
 def subsequent_mask(size):
@@ -127,8 +150,6 @@ def subsequent_mask(size):
     subsequent_mask = np.triu(np.ones(attn_shape), k=1).astype('uint8')
     return torch.from_numpy(subsequent_mask) == 0
 
-##############################
-##############################
 def attention(query, key, value, mask=None, dropout=None):
     "Compute 'Scaled Dot Product Attention'"
     d_k = query.size(-1)
@@ -160,7 +181,7 @@ class MultiHeadedAttention(nn.Module):
         nbatches = query.size(0)
         
         # 1) Do all the linear projections in batch from d_model => h x d_k 
-        query, key, value =             [l(x).view(nbatches, -1, self.h, self.d_k).transpose(1, 2)
+        query, key, value = [l(x).view(nbatches, -1, self.h, self.d_k).transpose(1, 2)
              for l, x in zip(self.linears, (query, key, value))]
         
         # 2) Apply attention on all the projected vectors in batch. 
@@ -168,10 +189,8 @@ class MultiHeadedAttention(nn.Module):
                                  dropout=self.dropout)
         
         # 3) "Concat" using a view and apply a final linear. 
-        x = x.transpose(1, 2).contiguous()              .view(nbatches, -1, self.h * self.d_k)
+        x = x.transpose(1, 2).contiguous().view(nbatches, -1, self.h * self.d_k)
         return self.linears[-1](x)
-##############################
-##############################
 
 
 class PositionwiseFeedForward(nn.Module):
@@ -193,6 +212,7 @@ class Embeddings(nn.Module):
 
     def forward(self, x):
         return self.lut(x) * math.sqrt(self.d_model)
+
 
 class PositionalEncoding(nn.Module):
     "Implement the PE function."
@@ -218,15 +238,17 @@ class PositionalEncoding(nn.Module):
 
 
 def make_model(src_vocab, tgt_vocab, N=6, 
-               d_model=512, d_ff=2048, h=8, dropout=0.1):
+               d_model=512, d_ff=2048, h=16, dropout=0.1):
     "Helper: Construct a model from hyperparameters."
     c = copy.deepcopy
     attn = MultiHeadedAttention(h, d_model)
     ff = PositionwiseFeedForward(d_model, d_ff, dropout)
     position = PositionalEncoding(d_model, dropout)
     model = FullModel(
+        Encoder(EncoderLayer(d_model, c(attn), c(ff), dropout), N),
         Decoder(DecoderLayer(d_model, c(attn), c(attn), 
                              c(ff), dropout), N),
+        nn.Sequential(Embeddings(d_model, src_vocab), c(position)),
         nn.Sequential(Embeddings(d_model, tgt_vocab), c(position)),
         Generator(d_model, tgt_vocab))
     
@@ -251,16 +273,23 @@ def make_model(src_vocab, tgt_vocab, N=6,
 
 
 
+
+
+
+
 class Batch:
     "Object for holding a batch of data with mask during training."
-    def __init__(self, src, trg=None, pad=0):
-        self.src = src
-        self.src_mask = (src != pad).unsqueeze(-2)
-        if trg is not None:
+    #def __init__(self, src, trg=None, pad=0):
+    def __init__(self, src, trg, pad=0):
+        self.src = trg[:,:-1]
+        self.src_mask = trg[:,:-1]
+        if 1:
             self.trg = trg[:, :-1]
+            #self.trg = x
             self.trg_y = trg[:, 1:]
-            self.trg_mask =                 self.make_std_mask(self.trg, pad)
-            self.ntokens = (self.trg_y != pad).data.sum()
+            #self.trg_y = y
+            self.trg_mask = self.make_std_mask(self.trg, pad)
+            #self.ntokens = (self.trg_y != pad).data.sum()
     
     @staticmethod
     def make_std_mask(tgt, pad):
@@ -271,123 +300,44 @@ class Batch:
         return tgt_mask
 
 
-def run_epoch(data_iter, model, loss_compute):
-    "Standard Training and Logging Function"
-    start = time.time()
-    total_tokens = 0
-    total_loss = 0
-    tokens = 0
-    for i, batch in enumerate(data_iter):
-        print (i)
-        out = model.forward(batch.src, batch.trg, 
-                            batch.src_mask, batch.trg_mask)
-        #out = model.forward(batch.trg, batch.trg_mask)
-        loss = loss_compute(out, batch.trg_y, batch.ntokens)
-        total_loss += loss
-        total_tokens += batch.ntokens
-        tokens += batch.ntokens
-        if i % 50 == 1:
-            elapsed = time.time() - start
-            print("Epoch Step: %d Loss: %f Tokens per Sec: %f" %
-                    (i, loss / batch.ntokens, tokens / elapsed))
-            start = time.time()
-            tokens = 0
-    return total_loss / total_tokens
-
-
-
-# ### Label Smoothing
-class LabelSmoothing(nn.Module):
-    "Implement label smoothing."
-    def __init__(self, size, padding_idx, smoothing=0.0):
-        super(LabelSmoothing, self).__init__()
-        self.criterion = nn.KLDivLoss(size_average=False)
-        self.padding_idx = padding_idx
-        self.confidence = 1.0 - smoothing
-        self.smoothing = smoothing
-        self.size = size
-        self.true_dist = None
-        
-    def forward(self, x, target):
-        assert x.size(1) == self.size
-        true_dist = x.data.clone()
-        true_dist.fill_(self.smoothing / (self.size - 2))
-        true_dist.scatter_(1, target.data.unsqueeze(1), self.confidence)
-        true_dist[:, self.padding_idx] = 0
-        mask = torch.nonzero(target.data == self.padding_idx)
-        if mask.dim() > 0:
-            true_dist.index_fill_(0, mask.squeeze(), 0.0)
-        self.true_dist = true_dist
-        return self.criterion(x, Variable(true_dist, requires_grad=False))
-
-
-# > Here we can see an example of how the mass is distributed to the words based on confidence. 
-
-# In[28]:
-
-
-#Example of label smoothing.
-crit = LabelSmoothing(5, 0, 0.4)
-#crit = nn.KLDivLoss(size_average=False) # TODO
-predict = torch.FloatTensor([[0, 0.2, 0.7, 0.1, 0],
-                             [0, 0.2, 0.7, 0.1, 0], 
-                             [0, 0.2, 0.7, 0.1, 0]])
-v = crit(Variable(predict.log()), 
-         Variable(torch.LongTensor([2, 1, 0])))
-
-# Show the target distributions expected by the system.
-plt.imshow(crit.true_dist)
-None
-
-
-
-
-
-
-
-
-
-
 # ## Synthetic Data
-def data_gen(V, batch, nbatches):
+def data_gen(V, batch, nbatches, seq_len): #batch = bs?
     "Generate random data for a src-tgt copy task."
     for i in range(nbatches):
-        data = torch.from_numpy(np.random.randint(1, V, size=(batch, 10)))
-        data[:, 0] = 1
+        # random sequence
+        data = torch.from_numpy(np.random.randint(1, V, size=(batch, seq_len)))
+        # constant sequence (0,1,2,3,...)
+        data = torch.arange(seq_len).repeat(batch).view(batch, seq_len)
         src = Variable(data, requires_grad=False)
         tgt = Variable(data, requires_grad=False)
         yield Batch(src, tgt, 0)
 
-# ## Loss Computation
-class SimpleLossCompute:
-    "A simple loss compute and train function."
-    def __init__(self, generator, criterion, opt=None):
-        self.generator = generator
-        self.criterion = criterion
-        self.opt = opt
-        
-    def __call__(self, x, y, norm):
-        x = self.generator(x)
-        loss = self.criterion(x.contiguous().view(-1, x.size(-1)), 
-                              y.contiguous().view(-1)) / norm
-        loss.backward()
-        if self.opt is not None:
-            self.opt.step()
-            self.opt.zero_grad()
-        return loss.data.item() * norm
-
-# Train the simple copy task.
-V = 11
-criterion = LabelSmoothing(size=V, padding_idx=0, smoothing=0.0)
+V = 5
+criterion = nn.CrossEntropyLoss()
 model = make_model(V, V, N=2)
-model_opt = torch.optim.Adam(model.parameters(), lr=0, betas=(0.9, 0.98), eps=1e-9)
+model_opt = torch.optim.SGD(model.parameters(), lr=0.1)
 
-for epoch in range(10):
-    model.train()
-    run_epoch(data_gen(V, 30, 20), model, 
-              SimpleLossCompute(model.generator, criterion, model_opt))
-    model.eval()
-    print(run_epoch(data_gen(V, 30, 5), model, 
-                    SimpleLossCompute(model.generator, criterion, None)))
+if 1:
+    # TODO: make sure we're computing the loss correctly (i.e. per-tstep or whatever)
+    for epoch in range(1000):
+        model.train()
+        data_iter = data_gen(V, 3, 7, V)
+        #model = model
+        start = time.time()
+        total_loss = 0
+        for i, batch in enumerate(data_iter):
+            #print (i)
+            out = model.forward(batch.src, batch.trg, 
+                                batch.src_mask, batch.trg_mask)
+            # TODO view shouldn't be hardcoded
+            loss = criterion(out.view(12,V), batch.trg_y.contiguous().view(12)) # FIXME or is it trg_y?
+            loss.backward()
+            total_loss += loss
+            if model_opt is not None:
+                model_opt.step()
+                model_opt.zero_grad()
+        print(total_loss)
+
+
 
 
