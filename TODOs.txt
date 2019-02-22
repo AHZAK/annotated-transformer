@@ -1,0 +1,12 @@
+
+- rm encoder
+- simplify data
+- rm label smoothing (bleah)
+
+
+NTS:
+ - do we need label smoothing!? (I hope not...)
+ - do we need special LR schedule (I hope not...)
+
+
+
